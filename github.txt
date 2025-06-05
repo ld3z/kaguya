@@ -1,0 +1,3 @@
+token=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+owner=user_name
+repo=repo_name
