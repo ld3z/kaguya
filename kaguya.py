@@ -6,9 +6,10 @@ import time # For time.monotonic() in Rich's columns and manga.json last_updated
 from datetime import datetime
 import re
 import sys # For sys.exit
-from typing import List, Dict, Tuple, Optional, Any, NamedTuple, Set
-from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+from typing import List, Dict, Tuple, Optional, Any, NamedTuple, Set, Callable
 import base64 # For GitHubJSONUploader
+
+from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
 from rich.console import Console
 from rich.progress import (
@@ -45,7 +46,6 @@ CHAPTER_PROC_UPLOAD_SUCCESS = "UPLOAD_SUCCESS"
 CHAPTER_PROC_SKIPPED_EXISTING_USER_CONFIRMED = "SKIPPED_EXISTING_USER_CONFIRMED"
 CHAPTER_PROC_ERROR_NO_IMAGES = "ERROR_NO_IMAGES"
 CHAPTER_PROC_ERROR_UPLOAD_FAILED = "ERROR_UPLOAD_FAILED"
-# CHAPTER_PROC_ERROR_JSON_KEY_CONFLICT = "ERROR_JSON_KEY_CONFLICT" # Optional new status
 
 # GitHub Constants
 GITHUB_CONFIG_FILE = "github.txt"
@@ -92,61 +92,32 @@ class CustomTimeDisplayColumn(ProgressColumn):
             return self._time_elapsed_col.render(task)
 
 
-# --- Helper function for unique chapter keys ---
-def get_unique_chapter_key_or_none(
-    base_key: str,
-    chapter_title: str, # For logging context
-    existing_chapters_dict: Dict[str, Any],
-    console_instance: Console # For printing messages
-) -> Optional[str]:
-    """
-    Generates a unique key for a chapter if the base_key already exists.
-    Tries appending 'a', 'b', ..., then '_1', '_2', ...
-    Returns the unique key, or None if a unique key cannot be found after
-    a reasonable number of attempts, to prevent accidental overwrites.
-    """
-    if not base_key: # Should not happen with current parse_folder_name, but good to check
-        console_instance.print("[red]Error: Base chapter key is empty. Cannot generate unique key.[/red]")
-        return None
-
-    if base_key not in existing_chapters_dict:
-        return base_key # Original key is already unique
-
-    console_instance.print(f"[yellow]Warning: Chapter key '{base_key}' (for title: '{chapter_title if chapter_title else 'N/A'}') already exists in manga.json. Attempting to find a unique key variant.[/yellow]")
-
-    final_key_candidate = base_key # Default, will be overwritten
-
-    # Try appending 'a', 'b', ...
-    for i in range(26): # Corresponds to 'a' through 'z'
-        suffix = chr(ord('a') + i)
-        final_key_candidate = f"{base_key}{suffix}"
-        if final_key_candidate not in existing_chapters_dict:
-            console_instance.print(f"[yellow]Using new key '{final_key_candidate}' for chapter originally parsed as '{base_key}' (title: '{chapter_title if chapter_title else 'N/A'}').[/yellow]")
-            return final_key_candidate
-
-    # If 'a' through 'z' are exhausted, try '_1', '_2', ...
-    for i in range(1, 101): # Corresponds to '_1' through '_100'
-        final_key_candidate = f"{base_key}_{i}"
-        if final_key_candidate not in existing_chapters_dict:
-            console_instance.print(f"[yellow]Using new key '{final_key_candidate}' for chapter originally parsed as '{base_key}' (title: '{chapter_title if chapter_title else 'N/A'}').[/yellow]")
-            return final_key_candidate
-
-    console_instance.print(f"[red]CRITICAL ERROR: Could not find a unique key for chapter '{base_key}' (title: '{chapter_title if chapter_title else 'N/A'}') after trying numerous suffixes (a-z, _1-_100).[/red]")
-    console_instance.print(f"[red]This chapter entry will be SKIPPED in manga.json to prevent data loss or corruption. Please check your folder naming or manually edit manga.json.[/red]")
-    return None
-
-
 # --- ImgChest Helper Functions ---
 def load_api_key(file_path: Path = API_KEY_FILE) -> Optional[str]:
     try:
         with open(file_path, 'r') as f:
             return f.read().strip()
     except FileNotFoundError:
-        console.print(f"[red]Error: API key file for image hosting ('{file_path}') not found. Please create it with your API key.[/red]")
+        console.print(f"[red]Error: API key file for ImgChest ('{file_path}') not found.[/red]")
         return None
     except IOError as e:
         console.print(f"[red]Error reading API key from {file_path}: {e}[/red]")
         return None
+
+def create_sample_api_key_file(file_path: Path = API_KEY_FILE):
+    """Creates a sample api_key.txt file if it doesn't exist."""
+    if file_path.exists():
+        console.print(f"ℹ️ [yellow]{file_path.name} already exists. Please ensure it's correctly filled out.[/yellow]")
+        return
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write("your_imgchest_api_key_here")
+        console.print(f"✅ Sample [cyan]{file_path.name}[/cyan] file created.")
+        console.print(f"👉 [bold]Please get your key from https://imgchest.com/profile/api and paste it into the file.[/bold]")
+    except Exception as e:
+        console.print(f"[red]❌ Error creating sample API key file [cyan]{file_path.name}[/cyan]: {str(e)}[/red]")
+    finally:
+        console.line()
 
 def parse_folder_name(folder_name: str) -> ChapterInfo:
     volume_pattern = r'V(\d+)\s+Ch(\d+(?:\.\d+)?)\s*(.*)?'
@@ -217,7 +188,7 @@ def save_upload_record(base_folder_path: Path, uploaded_folders: Dict[str, Dict[
     output_func = live.console.print if live else console.print
     try:
         with open(record_file, 'w', encoding='utf-8') as f:
-            f.write(f"# Manga Upload Record (via ImgChest) for {base_folder_path.name}\n")
+            f.write(f"# Manga Upload Record for {base_folder_path.name}\n")
             f.write("# Format: folder_name|album_url|timestamp|image_count|post_id\n")
             f.write(f"# Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             for folder_name, data in uploaded_folders.items():
@@ -335,19 +306,19 @@ def _perform_image_upload_to_host(
 
 def upload_initial_batch_to_host(image_files_batch: List[Path], api_key: str, chapter_name: str, batch_idx_info: str, progress: Progress) -> Dict[str, Any]:
     url = f"{IMGCHEST_API_BASE_URL}/post"
-    task_description = f"[cyan]Batch Image Upload (Create Album)[/cyan]: {chapter_name} ({batch_idx_info})"
+    task_description = f"[cyan]ImgChest Batch (Create Album)[/cyan]: {chapter_name} ({batch_idx_info})"
     result = _perform_image_upload_to_host(url, api_key, image_files_batch, progress, task_description)
     if result['success'] and 'data' in result:
         api_data = result['data'].get('data', {})
         if 'id' in api_data:
             return {'success': True, 'album_url': f"https://imgchest.com/p/{api_data['id']}",
                     'post_id': api_data['id'], 'total_images': len(api_data.get('images', []))}
-        return {'success': False, 'error': "Image hosting API response missing post ID."}
+        return {'success': False, 'error': "ImgChest API response missing post ID."}
     return result
 
 def add_images_to_existing_album_on_host(image_files_batch: List[Path], post_id: str, api_key: str, chapter_name: str, batch_idx_info: str, progress: Progress) -> Dict[str, Any]:
     url = f"{IMGCHEST_API_BASE_URL}/post/{post_id}/add"
-    task_description = f"[cyan]Batch Image Upload (Add Images)[/cyan]: {chapter_name} ({batch_idx_info})"
+    task_description = f"[cyan]ImgChest Batch (Add Images)[/cyan]: {chapter_name} ({batch_idx_info})"
     result = _perform_image_upload_to_host(url, api_key, image_files_batch, progress, task_description)
     if result['success']:
         return {'success': True, 'added_images': len(image_files_batch)}
@@ -371,19 +342,19 @@ def upload_all_images_for_chapter_to_host(
 
     try:
         chapter_batch_task_id = progress.add_task(
-            f"[blue]Chapter Upload Batches '{chapter_name_for_desc}'[/blue]",
+            f"[blue]ImgChest Upload Batches '{chapter_name_for_desc}'[/blue]",
             total=total_chunks, fields={"is_byte_task": False}
         )
         for i, chunk in enumerate(image_chunks):
             batch_info_str = f"Batch {i+1}/{total_chunks}"
             current_op_desc = "Create Album" if i == 0 else "Add Images"
             if chapter_batch_task_id and any(t.id == chapter_batch_task_id for t in progress.tasks):
-                progress.update(chapter_batch_task_id, description=f"[blue]Chapter '{chapter_name_for_desc}'[/blue] ({batch_info_str} - {current_op_desc})")
+                progress.update(chapter_batch_task_id, description=f"[blue]ImgChest '{chapter_name_for_desc}'[/blue] ({batch_info_str} - {current_op_desc})")
 
             if i == 0:
                 res = upload_initial_batch_to_host(chunk, api_key, chapter_name_for_desc, batch_info_str, progress)
                 if not res['success']:
-                    live.console.print(f"[red]❌ Error creating image album for '{chapter_name_for_desc}': {res.get('error', 'Unknown')}[/red]")
+                    live.console.print(f"[red]❌ Error creating ImgChest album for '{chapter_name_for_desc}': {res.get('error', 'Unknown')}[/red]")
                     return {'success': False, 'error': f"Failed to create album: {res.get('error', 'Unknown')}", 'total_uploaded': 0}
                 post_id, album_url = res['post_id'], res['album_url']
                 total_uploaded_count += res['total_images']
@@ -418,7 +389,6 @@ def upload_all_images_for_chapter_to_host(
                 progress.remove_task(chapter_batch_task_id)
 
     return {'success': True, 'album_url': album_url, 'post_id': post_id, 'total_uploaded': total_uploaded_count}
-
 
 # --- GitHub Uploader Class and Helper Functions ---
 class GitHubJSONUploader:
@@ -779,11 +749,11 @@ def process_single_chapter_folder(
     folder_details: FolderDetails,
     base_folder_path: Path,
     uploaded_folders_record: Dict[str, Dict[str, str]],
-    api_key: str,
     progress: Progress,
     live: Live,
     manga_json_data_to_update: Dict[str, Any],
-    manga_main_groups_info: str
+    manga_main_groups_info: str,
+    imgchest_api_key: str
 ) -> str:
     live.console.print(Panel(RichText(f"Processing Chapter Folder: {folder_details.name}", justify="center"), style="bold yellow", border_style="yellow"))
     image_files = get_image_files(folder_details.path, live)
@@ -793,7 +763,6 @@ def process_single_chapter_folder(
 
     chapter_info = parse_folder_name(folder_details.name)
 
-    # Ensure 'chapters' dictionary exists in the main manga_json_data for helper functions
     if 'chapters' not in manga_json_data_to_update:
         manga_json_data_to_update['chapters'] = {}
 
@@ -809,49 +778,13 @@ def process_single_chapter_folder(
         if current_live_status: live.start(refresh=True)
 
         if skip_choice != 'n':
-            live.console.print(f"[dim]Skipped re-upload for '{folder_details.name}'. Using existing record from {UPLOAD_RECORD_FILE}.[/dim]")
-
-            existing_post_id = existing_record['post_id']
-            found_in_json = False
-            for key, ch_data_json in manga_json_data_to_update.get('chapters', {}).items():
-                if isinstance(ch_data_json, dict) and 'groups' in ch_data_json:
-                    for group_url in ch_data_json['groups'].values():
-                        if isinstance(group_url, str) and existing_post_id in group_url:
-                            found_in_json = True
-                            live.console.print(f"[dim]Chapter '{folder_details.name}' (post_id: {existing_post_id}) already found in manga.json under key '{key}'. No JSON update needed for this chapter.[/dim]")
-                            break
-                if found_in_json:
-                    break
-
-            if not found_in_json:
-                live.console.print(f"[dim]Adding/Updating data for skipped chapter '{folder_details.name}' (post_id: {existing_post_id}) in manga.json as it wasn't found by its post_id.[/dim]")
-
-                final_chapter_key_for_skipped = get_unique_chapter_key_or_none(
-                    chapter_info.chapter,
-                    chapter_info.title,
-                    manga_json_data_to_update['chapters'],
-                    live.console
-                )
-
-                if final_chapter_key_for_skipped is not None:
-                    ch_data_existing: Dict[str, Any] = {
-                        "title": chapter_info.title,
-                        "last_updated": str(int(Path(folder_details.path).stat().st_mtime if Path(folder_details.path).exists() else time.time())),
-                        "groups": {manga_main_groups_info: f"/proxy/api/imgchest/chapter/{existing_post_id}"}
-                    }
-                    if chapter_info.volume: ch_data_existing["volume"] = chapter_info.volume
-                    manga_json_data_to_update['chapters'][final_chapter_key_for_skipped] = ch_data_existing
-                    live.console.print(f"[green]Successfully added/updated skipped chapter '{folder_details.name}' to manga.json with key '{final_chapter_key_for_skipped}'.[/green]")
-                else:
-                    # Error message already printed by get_unique_chapter_key_or_none
-                    live.console.print(f"[yellow]Warning: Skipped chapter '{folder_details.name}' (parsed as {chapter_info.chapter}, post_id: {existing_post_id}) could not be added/updated in manga.json due to persistent key conflict. It remains in {UPLOAD_RECORD_FILE}.[/yellow]")
-
+            live.console.print(f"[dim]Skipped re-upload for '{folder_details.name}'. The corresponding entry in manga.json (if any) will not be modified.[/dim]")
             return CHAPTER_PROC_SKIPPED_EXISTING_USER_CONFIRMED
 
     live.console.print(f"\n[bold]📂 Chapter Info:[/bold] V: {chapter_info.volume or 'N/A'}, Ch: {chapter_info.chapter}, Title: {chapter_info.title or 'N/A'}")
     live.console.print(f"[bold]📸 Found {len(image_files)} image(s).[/bold]", highlight= False)
 
-    upload_res = upload_all_images_for_chapter_to_host(image_files, api_key, folder_details.name, progress, live)
+    upload_res = upload_all_images_for_chapter_to_host(image_files, imgchest_api_key, folder_details.name, progress, live)
 
     if upload_res['success']:
         live.console.line()
@@ -866,28 +799,24 @@ def process_single_chapter_folder(
             'post_id': upload_res['post_id']
         }
 
-        final_chapter_key = get_unique_chapter_key_or_none(
-            chapter_info.chapter,
-            chapter_info.title,
-            manga_json_data_to_update['chapters'],
-            live.console
-        )
+        final_chapter_key = chapter_info.chapter
+        if final_chapter_key in manga_json_data_to_update['chapters']:
+            live.console.print(f"[yellow]Note: Chapter key '{final_chapter_key}' already exists in manga.json. It will be overwritten.[/yellow]")
 
-        if final_chapter_key is not None:
-            ch_data: Dict[str, Any] = {
-                "title": chapter_info.title,
-                "last_updated": str(int(time.time())),
-                "groups": {manga_main_groups_info: f"/proxy/api/imgchest/chapter/{upload_res['post_id']}"}
-            }
-            if chapter_info.volume: ch_data["volume"] = chapter_info.volume
-            manga_json_data_to_update['chapters'][final_chapter_key] = ch_data
-            live.console.print(f"[green]Chapter '{folder_details.name}' successfully added to manga.json with key '{final_chapter_key}'.[/green]")
-            return CHAPTER_PROC_UPLOAD_SUCCESS
-        else:
-            # Error message already printed by get_unique_chapter_key_or_none
-            live.console.print(f"[red]Critical: Chapter '{folder_details.name}' (parsed as {chapter_info.chapter}) was UPLOADED successfully, but could NOT be added to manga.json due to a persistent key conflict.[/red]")
-            live.console.print(f"[red]The upload IS recorded in '{UPLOAD_RECORD_FILE}'. You may need to manually edit manga.json or resolve folder naming issues.[/red]")
-            return CHAPTER_PROC_ERROR_UPLOAD_FAILED # Treats as overall failure for this chapter's processing if JSON add fails
+        proxy_path = f"/proxy/api/imgchest/chapter/{upload_res['post_id']}"
+
+        ch_data: Dict[str, Any] = {
+            "title": chapter_info.title,
+            "last_updated": str(int(time.time())),
+            "groups": {manga_main_groups_info: proxy_path}
+        }
+        if chapter_info.volume:
+            ch_data["volume"] = chapter_info.volume
+
+        manga_json_data_to_update['chapters'][final_chapter_key] = ch_data
+        live.console.print(f"[green]Chapter '{folder_details.name}' successfully added/updated in manga.json with key '{final_chapter_key}'.[/green]")
+        return CHAPTER_PROC_UPLOAD_SUCCESS
+
     else:
         live.console.line()
         live.console.print(f"[bold red]❌ Chapter Upload FAILED for '{folder_details.name}': {upload_res.get('error', 'Unknown')}[/bold red]")
@@ -918,14 +847,16 @@ def parse_folder_selection(selection_str: str, num_folders: int) -> Optional[Lis
 
 def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
     """Handles chapter image upload and/or prepares for GitHub update for a selected manga folder."""
-    api_key = load_api_key()
-    if not api_key:
-        if not console.input("[yellow]Image hosting API key not found. Continue with GitHub-only options? (y/N): [/yellow]").strip().lower() == 'y':
-            console.print("[red]API key is required for image uploads. Exiting.[/red]")
+    imgchest_api_key = load_api_key()
+    console.line()
+
+    if not imgchest_api_key:
+        if not console.input("[yellow]ImgChest API key not configured. Continue with GitHub-only options? (y/N): [/yellow]").strip().lower() == 'y':
+            console.print("[red]ImgChest API key is required for uploads. Exiting.[/red]")
             return None
-        console.print("[yellow]Proceeding without image hosting API key. Image upload options will be disabled.[/yellow]")
-    elif api_key:
-        console.print("[green]API key for ImgChest loaded.[/green]")
+        console.print("[yellow]Proceeding without API key. Image upload options will be disabled.[/yellow]")
+    else:
+        console.print("[green]ImgChest API key loaded successfully.[/green]")
     console.line()
 
 
@@ -949,13 +880,12 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
     manga_json_data, manga_json_file_path = load_manga_json(base_folder_path, manga_title_for_json)
 
     for key in ['title', 'description', 'artist', 'author', 'cover']:
-        if manga_overall_info.get(key): # Only update if info.txt has a value
+        if manga_overall_info.get(key):
             manga_json_data[key] = manga_overall_info[key]
-        elif not manga_json_data.get(key) and key == 'title': # Ensure title is at least folder name if nothing else
+        elif not manga_json_data.get(key) and key == 'title':
              manga_json_data[key] = base_folder_path.name
 
-
-    if 'chapters' not in manga_json_data: # Ensure chapters dict exists before any processing
+    if 'chapters' not in manga_json_data:
         manga_json_data['chapters'] = {}
 
     manga_main_groups = manga_overall_info.get('groups', 'UnknownGroup')
@@ -994,32 +924,31 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
     while True:
         console.line()
         choice_input = console.input("[bold cyan]Choose an option (1-5):[/bold cyan] ").strip()
-        if choice_input == '1':
-            if not api_key: console.print("[red]Image hosting API key not loaded. Cannot perform image uploads.[/red]"); continue
+        if choice_input in ['1', '2', '3']:
+            if not imgchest_api_key: console.print("[red]ImgChest API key is not configured. Cannot perform image uploads.[/red]"); continue
             if not subfolders_with_images: console.print("[yellow]No folders with images available for this option.[/yellow]"); continue
-            folders_to_process = subfolders_with_images; choice = choice_input; break
-        elif choice_input == '2':
-            if not api_key: console.print("[red]Image hosting API key not loaded. Cannot perform image uploads.[/red]"); continue
-            if not subfolders_with_images: console.print("[yellow]No folders with images available for this option.[/yellow]"); continue
-            folders_to_process = [f for f in subfolders_with_images if f.name not in uploaded_chapter_record]
-            if not folders_to_process: console.print("[yellow]No new/unrecorded folders to process. Try another option.[/yellow]"); continue
-            choice = choice_input; break
-        elif choice_input == '3':
-            if not api_key: console.print("[red]Image hosting API key not loaded. Cannot perform image uploads.[/red]"); continue
-            if not subfolders_with_images: console.print("[yellow]No folders with images available for this option.[/yellow]"); continue
-            sel_str = console.input("[cyan]Enter folder numbers (e.g., 1,3,5-7):[/cyan] ").strip()
-            indices = parse_folder_selection(sel_str, len(subfolders_with_images))
-            if indices is not None:
-                folders_to_process = [subfolders_with_images[i] for i in indices]
-                if folders_to_process: choice = choice_input; break
-                else: console.print("[yellow]No valid folders selected from your input. Try again.[/yellow]")
+
+            if choice_input == '1':
+                folders_to_process = subfolders_with_images; choice = choice_input; break
+            elif choice_input == '2':
+                folders_to_process = [f for f in subfolders_with_images if f.name not in uploaded_chapter_record]
+                if not folders_to_process: console.print("[yellow]No new/unrecorded folders to process. Try another option.[/yellow]"); continue
+                choice = choice_input; break
+            elif choice_input == '3':
+                sel_str = console.input("[cyan]Enter folder numbers (e.g., 1,3,5-7):[/cyan] ").strip()
+                indices = parse_folder_selection(sel_str, len(subfolders_with_images))
+                if indices is not None:
+                    folders_to_process = [subfolders_with_images[i] for i in indices]
+                    if folders_to_process: choice = choice_input; break
+                    else: console.print("[yellow]No valid folders selected from your input. Try again.[/yellow]")
+
         elif choice_input == '4':
             if not manga_json_file_path.exists():
                 console.print(f"[red]Error: Manga JSON file '{manga_json_file_path.name}' does not exist in '{base_folder_path}'.[/red]")
                 console.print("[yellow]This option requires an existing manga.json. Please run an image upload option first or ensure the file exists.[/yellow]")
                 continue
             console.print(f"[green]Selected 'Update GitHub only'. Will use existing '{manga_json_file_path.name}'.[/green]")
-            folders_to_process = [] # No folders to process for image uploads
+            folders_to_process = []
             is_github_only_choice = True
             choice = choice_input; break
         elif choice_input == '5':
@@ -1028,79 +957,56 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
 
     newly_uploaded_or_reuploaded_count = 0
     user_confirmed_skipped_count = 0
-    # failed_processing_count can be derived from total_selected - (uploaded + skipped)
 
     if not is_github_only_choice:
         if not folders_to_process:
             console.line()
             console.print("[yellow]No chapter folders were identified for image upload based on your selection.[/yellow]")
-            # Save manga_json even if no uploads, as metadata might have been updated
             save_manga_json(manga_json_file_path, manga_json_data)
             console.line()
-            return {
-                "manga_json_path": manga_json_file_path,
-                "base_folder_path": base_folder_path,
-                "manga_title": manga_title_for_json,
-                "total_selected_for_upload": 0,
-                "newly_uploaded_count": 0,
-                "skipped_existing_count": 0,
-                "is_github_only_mode": False
-            }
+            return { "manga_json_path": manga_json_file_path, "base_folder_path": base_folder_path, "manga_title": manga_title_for_json, "is_github_only_mode": False }
 
         console.line()
-        console.print("[bold underline]Will process for chapter image upload:[/bold underline]")
+        console.print(f"[bold underline]Will process using [cyan]ImgChest[/cyan]:[/bold underline]")
         for fd in folders_to_process: console.print(f"  - {fd.name}")
         console.line()
         if console.input("[bold yellow]Proceed with chapter image uploads? (y/N):[/bold yellow] ").strip().lower() != 'y':
             console.print("[yellow]Chapter image upload processing canceled by user.[/yellow]")
-            save_manga_json(manga_json_file_path, manga_json_data) # Save any metadata changes
+            save_manga_json(manga_json_file_path, manga_json_data)
             console.line()
-            return {
-                "manga_json_path": manga_json_file_path,
-                "base_folder_path": base_folder_path,
-                "manga_title": manga_title_for_json,
-                "total_selected_for_upload": len(folders_to_process), # They were selected, but user cancelled op
-                "newly_uploaded_count": 0,
-                "skipped_existing_count": 0,
-                "is_github_only_mode": False
-            }
+            return { "manga_json_path": manga_json_file_path, "base_folder_path": base_folder_path, "manga_title": manga_title_for_json, "is_github_only_mode": False }
 
         console.line()
-        console.print("[bold underline]🚀 Starting chapter image uploads...[/bold underline]")
+        console.print("[bold underline]🚀 Starting chapter image uploads via ImgChest...[/bold underline]")
         progress_columns = [ SpinnerColumn(finished_text="[green]✓[/green]"), TextColumn("[progress.description]{task.description}", justify="left"), BarColumn(bar_width=None), TextColumn("[progress.percentage]{task.percentage:>3.1f}%"), TextColumn("• {task.completed} of {task.total} •"), ConditionalTransferSpeedColumn(), ConditionalFileSizeColumn(), CustomTimeDisplayColumn()]
         progress_bar_manager = Progress(*progress_columns, console=console, transient=False, expand=True)
 
         with Live(progress_bar_manager, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
-            overall_task_id = progress_bar_manager.add_task("[bold #AAAAFF]Overall Chapter Upload Progress[/bold #AAAAFF]", total=len(folders_to_process), fields={"is_byte_task": False})
+            overall_task_id = progress_bar_manager.add_task("[bold #AAAAFF]Overall ImgChest Upload Progress[/bold #AAAAFF]", total=len(folders_to_process), fields={"is_byte_task": False})
 
             for folder_item in folders_to_process:
-                if not api_key: # Should have been caught earlier, but as a safeguard
-                    live.console.print("[red]Error: API Key for image hosting is missing. Cannot upload images.[/red]")
-                    break
-
                 chapter_processing_status = process_single_chapter_folder(
-                    folder_item, base_folder_path, uploaded_chapter_record, api_key,
-                    progress_bar_manager, live, manga_json_data, manga_main_groups
+                    folder_item, base_folder_path, uploaded_chapter_record,
+                    progress_bar_manager, live, manga_json_data, manga_main_groups,
+                    imgchest_api_key
                 )
 
                 if chapter_processing_status == CHAPTER_PROC_UPLOAD_SUCCESS:
                     newly_uploaded_or_reuploaded_count += 1
                 elif chapter_processing_status == CHAPTER_PROC_SKIPPED_EXISTING_USER_CONFIRMED:
                     user_confirmed_skipped_count += 1
-                # Other statuses (ERROR_NO_IMAGES, ERROR_UPLOAD_FAILED) are considered failures for the summary
 
-                save_upload_record(base_folder_path, uploaded_chapter_record, live) # Save record after each attempt
+                save_upload_record(base_folder_path, uploaded_chapter_record, live)
                 if any(t.id == overall_task_id for t in progress_bar_manager.tasks):
                     progress_bar_manager.update(overall_task_id, advance=1)
                 live.console.line()
 
             if any(t.id == overall_task_id for t in progress_bar_manager.tasks):
-                progress_bar_manager.update(overall_task_id, completed=len(folders_to_process), description="[bold green]Overall Chapter Upload Progress Complete[/bold green]")
+                progress_bar_manager.update(overall_task_id, completed=len(folders_to_process), description="[bold green]Overall ImgChest Upload Progress Complete[/bold green]")
             live.console.line()
 
     save_manga_json(manga_json_file_path, manga_json_data)
     console.line()
-
     total_selected_for_upload = len(folders_to_process) if not is_github_only_choice else 0
 
     if is_github_only_choice:
@@ -1111,23 +1017,21 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
 
         summary_details = []
         if newly_uploaded_or_reuploaded_count > 0:
-            summary_details.append(f"{newly_uploaded_or_reuploaded_count} uploaded/re-uploaded successfully (incl. JSON update)")
+            summary_details.append(f"{newly_uploaded_or_reuploaded_count} uploaded/re-uploaded successfully")
         if user_confirmed_skipped_count > 0:
-            summary_details.append(f"{user_confirmed_skipped_count} skipped (already existed, JSON checked/updated)")
+            summary_details.append(f"{user_confirmed_skipped_count} skipped (already existed)")
         if failures_during_processing > 0:
-            summary_details.append(f"{failures_during_processing} failed or had issues with JSON update")
+            summary_details.append(f"{failures_during_processing} failed")
 
         detail_str = f" ({'; '.join(summary_details)})" if summary_details else ""
 
         if failures_during_processing == 0 and total_accounted_for_positively == total_selected_for_upload :
             console.print(f"[bold green]🎉 All {total_accounted_for_positively}/{total_selected_for_upload} selected chapter folders processed successfully{detail_str}.[/bold green]")
         else:
-            console.print(f"[bold yellow]⚠️ Chapter processing for {total_selected_for_upload} selected folders: {total_accounted_for_positively} processed positively, {failures_during_processing} had issues{detail_str}.[/bold yellow]")
-            console.print(f"[yellow]   Please review logs above for details on any failures or JSON key conflict warnings.[/yellow]")
-    else: # No folders were selected for upload processing, or it's GitHub only mode without prior uploads
-         if not is_github_only_choice: # Only print this if not in GitHub only mode
+            console.print(f"[bold yellow]⚠️ Chapter processing for {total_selected_for_upload} selected folders complete with issues{detail_str}.[/bold yellow]")
+    else:
+         if not is_github_only_choice:
             console.print("[yellow]No chapter image uploads were performed or selected.[/yellow]")
-
 
     console.print(f"Manga JSON reference: [cyan]{manga_json_file_path}[/cyan]")
     console.line()
@@ -1136,9 +1040,6 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
         "manga_json_path": manga_json_file_path,
         "base_folder_path": base_folder_path,
         "manga_title": manga_title_for_json,
-        "total_selected_for_upload": total_selected_for_upload,
-        "newly_uploaded_count": newly_uploaded_or_reuploaded_count,
-        "skipped_existing_count": user_confirmed_skipped_count,
         "is_github_only_mode": is_github_only_choice
     }
 
@@ -1147,17 +1048,18 @@ def main():
     console.print(Panel(RichText("Welcome to Kaguya!", justify="center", style="bold hot_pink"), border_style="hot_pink"))
     console.line()
 
-    github_config_exists_and_valid = False
+    # --- Config file checks ---
+    if not Path(API_KEY_FILE).exists():
+        console.print(f"[yellow]ImgChest API key file ([cyan]{API_KEY_FILE}[/cyan]) not found.[/yellow]")
+        create_sample_api_key_file()
+
     if not Path(GITHUB_CONFIG_FILE).exists():
         console.print(f"[yellow]GitHub configuration file ([cyan]{GITHUB_CONFIG_FILE}[/cyan]) not found.[/yellow]")
         create_sample_github_config()
     else:
-        if load_github_config():
-            github_config_exists_and_valid = True
-
-    if not github_config_exists_and_valid:
-        console.print(f"[yellow]Warning: GitHub configuration ([cyan]{GITHUB_CONFIG_FILE}[/cyan]) is missing or invalid. GitHub uploads will not be possible until fixed.[/yellow]")
-        console.line()
+        if not load_github_config():
+            console.print(f"[yellow]Warning: GitHub configuration ([cyan]{GITHUB_CONFIG_FILE}[/cyan]) is invalid. GitHub uploads will not be possible until fixed.[/yellow]")
+            console.line()
 
     upload_result_summary = run_chapter_upload_processing()
 
@@ -1172,7 +1074,6 @@ def main():
         console.line()
         sys.exit(1)
 
-    manga_base_folder_path = upload_result_summary.get("base_folder_path", Path("."))
     manga_title_for_commit = upload_result_summary.get("manga_title", manga_json_local_path.stem)
     is_github_only_mode = upload_result_summary.get("is_github_only_mode", False)
 
@@ -1191,7 +1092,6 @@ def main():
         github_config = load_github_config()
         if not github_config:
             console.print(f"[red]GitHub configuration ([cyan]{GITHUB_CONFIG_FILE}[/cyan]) is missing or invalid. Cannot upload to GitHub.[/red]")
-            console.print(f"[yellow]Please ensure [cyan]{GITHUB_CONFIG_FILE}[/cyan] is correctly set up.[/yellow]")
             console.line()
             sys.exit(1)
 
@@ -1202,13 +1102,11 @@ def main():
             console_instance=console
         )
 
-        default_repo_subfolder = ""
         repo_subfolder_prompt = (
             f"[cyan]Enter target subfolder in GitHub repo for '[white]{manga_json_local_path.name}[/white]' "
             f"(e.g., 'manga/seriesX').\nPress Enter for default (repository root): [/cyan]"
         )
-        repo_subfolder_input = console.input(repo_subfolder_prompt).strip()
-        repo_subfolder = repo_subfolder_input if repo_subfolder_input else default_repo_subfolder
+        repo_subfolder = console.input(repo_subfolder_prompt).strip()
         console.line()
 
         repo_file_path_parts = [p.strip('/') for p in [repo_subfolder, manga_json_local_path.name] if p.strip('/')]
@@ -1216,7 +1114,6 @@ def main():
         commit_message = f"Update: {manga_title_for_commit} ({manga_json_local_path.name})"
 
         console.print("[bold underline]🚀 Starting GitHub Upload...[/bold underline]")
-
         progress_columns_github = [
             SpinnerColumn(finished_text="[green]✓[/green]"),
             TextColumn("[progress.description]{task.description}", justify="left"),
@@ -1251,7 +1148,7 @@ def main():
         if github_upload_op_result.get("success"):
             cubari_item_for_log = {
                 "title": manga_title_for_commit,
-                "folder_path": str(manga_base_folder_path.resolve()),
+                "folder_path": str(manga_json_local_path.parent.resolve()),
                 "file": manga_json_local_path.name,
                 "repo_path": repo_file_path_str,
                 "raw_url": github_upload_op_result["raw_url"],
@@ -1285,6 +1182,6 @@ if __name__ == "__main__":
     except Exception as e:
         console.line()
         console.print(f"[bold red]An unexpected critical error occurred:[/bold red]")
-        console.print_exception(show_locals=False) # Set show_locals=True for more detailed debugging if needed
+        console.print_exception(show_locals=False)
         console.line()
         sys.exit(1)

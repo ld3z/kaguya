@@ -22,7 +22,7 @@ pip install -r requirements.txt
 - markdown-it-py==3.0.0
 - mdurl==0.1.2
 - pygments==2.19.1
-- requests==2.32.3
+- requests==2.32.4
 - requests-toolbelt==1.0.0
 - rich==14.0.0
 - urllib3==2.4.0
