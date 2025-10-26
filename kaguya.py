@@ -753,6 +753,7 @@ def process_single_chapter_folder(
     live: Live,
     manga_json_data_to_update: Dict[str, Any],
     manga_main_groups_info: str,
+    manga_json_file_path: Path,
     imgchest_api_key: str
 ) -> str:
     live.console.print(Panel(RichText(f"Processing Chapter Folder: {folder_details.name}", justify="center"), style="bold yellow", border_style="yellow"))
@@ -814,6 +815,10 @@ def process_single_chapter_folder(
             ch_data["volume"] = chapter_info.volume
 
         manga_json_data_to_update['chapters'][final_chapter_key] = ch_data
+
+        # Persist manga.json after each successful chapter update
+        save_manga_json(manga_json_file_path, manga_json_data_to_update, live)
+
         live.console.print(f"[green]Chapter '{folder_details.name}' successfully added/updated in manga.json with key '{final_chapter_key}'.[/green]")
         return CHAPTER_PROC_UPLOAD_SUCCESS
 
@@ -844,6 +849,60 @@ def parse_folder_selection(selection_str: str, num_folders: int) -> Optional[Lis
         return sorted(list(selected_indices))
     except ValueError:
         console.print("[red]Invalid format. Use numbers or ranges like 1,3,5-7.[/red]"); return None
+
+def regenerate_manga_json_from_folders(
+    base_folder_path: Path,
+    subfolders_with_images: List[FolderDetails],
+    uploaded_chapter_record: Dict[str, Dict[str, str]],
+    manga_json_data: Dict[str, Any],
+    manga_main_groups: str,
+    manga_json_file_path: Path,
+    live: Optional[Live] = None
+) -> None:
+    """Rebuilds the manga_json_data['chapters'] from the current subfolders and the upload record, then saves it."""
+    output_func = live.console.print if live else console.print
+    output_func(f"[dim]Regenerating manga.json for: {base_folder_path}[/dim]")
+    if 'chapters' not in manga_json_data:
+        manga_json_data['chapters'] = {}
+    # Start fresh
+    manga_json_data['chapters'].clear()
+
+    for fd in subfolders_with_images:
+        chapter_info = parse_folder_name(fd.name)
+        final_chapter_key = chapter_info.chapter
+
+        proxy_groups: Dict[str, str] = {}
+        post_id = None
+        if fd.name in uploaded_chapter_record:
+            post_id = uploaded_chapter_record[fd.name].get('post_id')
+            if post_id:
+                proxy_groups = {manga_main_groups: f"/proxy/api/imgchest/chapter/{post_id}"}
+
+            ts_str = uploaded_chapter_record[fd.name].get('timestamp')
+            try:
+                if ts_str:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    last_updated = str(int(time.mktime(dt.timetuple())))
+                else:
+                    last_updated = str(int(time.time()))
+            except Exception:
+                last_updated = str(int(time.time()))
+        else:
+            last_updated = str(int(time.time()))
+
+        ch_data: Dict[str, Any] = {
+            "title": chapter_info.title,
+            "last_updated": last_updated,
+            "groups": proxy_groups
+        }
+        if chapter_info.volume:
+            ch_data["volume"] = chapter_info.volume
+
+        manga_json_data['chapters'][final_chapter_key] = ch_data
+        output_func(f"[dim]Added chapter {final_chapter_key}: {fd.name} (uploaded={'yes' if post_id else 'no'})[/dim]")
+
+    save_manga_json(manga_json_file_path, manga_json_data, live)
+    output_func(f"[green]Manga JSON regenerated and saved to: {manga_json_file_path}[/green]")
 
 def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
     """Handles chapter image upload and/or prepares for GitHub update for a selected manga folder."""
@@ -915,7 +974,8 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
                   "2. Upload only new folders (skip already uploaded)\n"
                   "3. Select specific folder(s) to upload/re-upload\n"
                   "4. Update GitHub only (uses existing manga.json for this manga)\n"
-                  "5. Cancel", highlight=False)
+                  "5. Regenerate manga.json from current folders (uses upload records)\n"
+                  "6. Cancel", highlight=False)
 
     folders_to_process: List[FolderDetails] = []
     choice = ''
@@ -923,7 +983,7 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
 
     while True:
         console.line()
-        choice_input = console.input("[bold cyan]Choose an option (1-5):[/bold cyan] ").strip()
+        choice_input = console.input("[bold cyan]Choose an option (1-6):[/bold cyan] ").strip()
         if choice_input in ['1', '2', '3']:
             if not imgchest_api_key: console.print("[red]ImgChest API key is not configured. Cannot perform image uploads.[/red]"); continue
             if not subfolders_with_images: console.print("[yellow]No folders with images available for this option.[/yellow]"); continue
@@ -952,8 +1012,17 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
             is_github_only_choice = True
             choice = choice_input; break
         elif choice_input == '5':
+            # Regenerate manga.json from current folders and existing upload record, then quit
+            console.line()
+            console.print("[bold underline]Regenerate manga.json from current folders and upload records[/bold underline]")
+            regenerate_manga_json_from_folders(base_folder_path, subfolders_with_images, uploaded_chapter_record, manga_json_data, manga_main_groups, manga_json_file_path)
+            console.line()
+            console.print("[green]Regeneration complete. Exiting.[/green]")
+            console.line()
+            sys.exit(0)
+        elif choice_input == '6':
             console.print("[yellow]Processing canceled by user.[/yellow]"); console.line(); return None
-        else: console.print("[red]Invalid choice. Please enter a number between 1 and 5.[/red]")
+        else: console.print("[red]Invalid choice. Please enter a number between 1 and 6.[/red]")
 
     newly_uploaded_or_reuploaded_count = 0
     user_confirmed_skipped_count = 0
@@ -988,7 +1057,7 @@ def run_chapter_upload_processing() -> Optional[Dict[str, Any]]:
                 chapter_processing_status = process_single_chapter_folder(
                     folder_item, base_folder_path, uploaded_chapter_record,
                     progress_bar_manager, live, manga_json_data, manga_main_groups,
-                    imgchest_api_key
+                    manga_json_file_path, imgchest_api_key
                 )
 
                 if chapter_processing_status == CHAPTER_PROC_UPLOAD_SUCCESS:
